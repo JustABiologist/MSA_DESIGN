@@ -44,7 +44,9 @@ temp/
 
 data/*
 weights/*
+outputs/*
 
 # Keep directory placeholders
 !data/.gitkeep
 !weights/.gitkeep
+!outputs/.gitkeep
