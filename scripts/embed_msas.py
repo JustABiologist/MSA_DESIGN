@@ -14,6 +14,10 @@ from typing import Any
 AMINO_ACID_OR_GAP_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ-")
 DEFAULT_WEIGHTS = "weights/esm_msa1b_t12_100M_UR50S.pt"
 DEFAULT_OUT_DIR = "outputs/embeddings"
+CONTACT_REGRESSION_URL_TEMPLATE = (
+    "https://dl.fbaipublicfiles.com/fair-esm/regression/"
+    "{model_name}-contact-regression.pt"
+)
 POOLING_DESCRIPTION = {
     "token_embeddings": "Per-MSA-token representation aligned to cleaned MSA columns, shape rows x cols x hidden_dim.",
     "aa_mask": "Boolean rows x cols mask, true for non-gap cleaned MSA positions.",
@@ -127,6 +131,10 @@ def crop_msa(msa: dict[str, Any], max_seqs: int, max_cols: int) -> tuple[dict[st
     }, warnings
 
 
+def contact_regression_path(weights_path: Path) -> Path:
+    return Path(str(weights_path.with_suffix("")) + "-contact-regression.pt")
+
+
 def output_stem(msa_path: Path) -> str:
     name = msa_path.name
     for suffix in (".msa.fasta", ".msa.fa", ".a3m", ".fasta", ".fa", ".fas"):
@@ -181,6 +189,7 @@ def base_metadata(
         "output_npz": str(npz_path),
         "output_metadata": str(metadata_path),
         "weights": str(Path(args.weights)),
+        "contact_regression_weights": str(contact_regression_path(Path(args.weights))),
         "layer": args.layer,
         "requested_device": args.device,
         "dtype": args.dtype,
@@ -431,6 +440,14 @@ def main() -> int:
     weights_path = Path(args.weights)
     if not weights_path.exists():
         raise SystemExit(f"Weights not found: {weights_path}. Expected local ESM-MSA-1b weights or pass --weights.")
+    regression_path = contact_regression_path(weights_path)
+    if not regression_path.exists():
+        model_name = weights_path.stem
+        url = CONTACT_REGRESSION_URL_TEMPLATE.format(model_name=model_name)
+        raise SystemExit(
+            "fair-esm local loading expects the contact-regression sidecar next to the model weights, "
+            f"even for representation extraction. Missing: {regression_path}. Download: {url}"
+        )
 
     np, torch, esm = require_runtime_modules()
     device = choose_device(torch, args.device)

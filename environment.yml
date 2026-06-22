@@ -1,0 +1,13 @@
+name: msa_design
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy
+  - pip
+  - pytorch
+  - pytorch-cuda=12.4
+  - pip:
+      - fair-esm

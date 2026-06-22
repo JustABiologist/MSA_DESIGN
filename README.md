@@ -9,6 +9,7 @@ Large local artifacts are intentionally ignored by git:
 - `outputs/pilot_msas/` FASTA, metadata TSV, and MSA pilot outputs
 - `outputs/embeddings/` MSA Transformer `.npz` tensors and metadata JSON files
 - `weights/esm_msa1b_t12_100M_UR50S.pt`, ESM MSA Transformer weights
+- `weights/esm_msa1b_t12_100M_UR50S-contact-regression.pt`, tiny `fair-esm` sidecar expected by local model loading
 
 ## Data Framing
 
@@ -31,6 +32,24 @@ This repository is for the first assumption-checking step of a sequence-design i
 The `kcat/Km` column is preserved as a dataset-provided value, not recomputed from the displayed `kcat` and `Km` fields. Missing kinetic values appear as `nan` in some rows.
 
 Supplementary files in the zip provide headers for compounds, domains, EC names, gene cross-references, organisms, and reactions. The pipeline reads the zip directly and does not extract the full archive.
+
+
+## Dedicated Conda Environment
+
+A separate CUDA-enabled conda environment is defined in `environment.yml` and has been created locally as `msa_design` under Miniforge:
+
+```bash
+/home/florian/miniforge3/bin/mamba env create -f environment.yml
+conda activate msa_design
+```
+
+Without shell activation, run commands through the environment directly:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py --help
+```
+
+The environment includes Python 3.10, NumPy, CUDA PyTorch (`pytorch-cuda=12.4`), and `fair-esm`. On this machine it detects the RTX 3060 via CUDA.
 
 ## Commands
 
@@ -76,12 +95,12 @@ python3 scripts/pilot_families.py --families 3 --seqs-per-family 5 --scan-files 
 
 ## MSA Transformer Embedding
 
-`scripts/embed_msas.py` embeds aligned FASTA/A3M files with ESM MSA Transformer using the local ignored weights at `weights/esm_msa1b_t12_100M_UR50S.pt`. The real embedding path requires an environment with `torch`, `numpy`, and `esm`/`fair-esm` installed. The script imports `torch` and `esm` lazily, so parsing and shape checks can run without those packages.
+`scripts/embed_msas.py` embeds aligned FASTA/A3M files with ESM MSA Transformer using the local ignored weights at `weights/esm_msa1b_t12_100M_UR50S.pt`. The real embedding path requires an environment with `torch`, `numpy`, and `esm`/`fair-esm` installed; use the dedicated `msa_design` environment above. The script imports `torch` and `esm` lazily, so parsing and shape checks can run without those packages.
 
 Dry-run one pilot MSA without loading the model:
 
 ```bash
-python3 scripts/embed_msas.py \
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
   --msa outputs/pilot_msas/ec_1_1_1_3.msa.fasta \
   --out-dir outputs/embeddings \
   --dry-run
@@ -90,7 +109,7 @@ python3 scripts/embed_msas.py \
 Dry-run every pilot MSA:
 
 ```bash
-python3 scripts/embed_msas.py \
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
   --msa-glob 'outputs/pilot_msas/*.msa.fasta' \
   --out-dir outputs/embeddings \
   --dry-run
@@ -99,14 +118,14 @@ python3 scripts/embed_msas.py \
 Prepare reproducible embedding commands or a TSV manifest:
 
 ```bash
-python3 scripts/prepare_embedding_jobs.py --dry-run
-python3 scripts/prepare_embedding_jobs.py --out-manifest outputs/embeddings/jobs.tsv
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/prepare_embedding_jobs.py --dry-run
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/prepare_embedding_jobs.py --out-manifest outputs/embeddings/jobs.tsv
 ```
 
-Run real embedding once `torch` and `fair-esm` are available:
+Run real embedding in the dedicated environment:
 
 ```bash
-python3 scripts/embed_msas.py \
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
   --msa-glob 'outputs/pilot_msas/*.msa.fasta' \
   --weights weights/esm_msa1b_t12_100M_UR50S.pt \
   --out-dir outputs/embeddings \
@@ -138,5 +157,5 @@ The fetcher sleeps between REST calls by default and caches JSON responses under
 - Decide whether sequence families should be grouped by exact EC, EC prefix, reaction, substrate, organism domain, or combinations of those fields.
 - Require verified KEGG cross-references for production sequence sets, or manually audit unverified fallbacks.
 - Replace the fallback aligner with MAFFT or another production aligner for real training data.
-- Install or select a Python environment with `torch` and `fair-esm` so `scripts/embed_msas.py` can run real MSA Transformer forward passes.
+- Scale MSA Transformer embedding beyond smoke tests and decide which pooled/token representations feed the projection model.
 - Define train/validation splits by homology or family, not random rows, to avoid leakage in downstream design models.
