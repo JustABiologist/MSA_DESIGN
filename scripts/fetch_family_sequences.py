@@ -23,6 +23,13 @@ from typing import Any
 ENZYME_PREFIX = "input_data/enzymes/"
 EXPECTED_ENZYME_COLUMNS = 11
 NUMERIC_COLUMN_INDEXES = range(6, 11)
+KINETIC_COLUMN_VALUE_FIELDS = {
+    6: "kcat_1_per_s_values",
+    7: "km_mM_values",
+    8: "kcat_over_km_1_per_mM_s_values",
+    9: "topt_C_values",
+    10: "tm_C_values",
+}
 UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
 USER_AGENT = "MSA_DESIGN pilot sequence fetcher (UniProt REST; contact unavailable)"
 FASTA_WRAP = 80
@@ -321,7 +328,7 @@ def summarize_rows(rows: list[list[str]]) -> dict[str, str]:
         "compound_ids": unique_join([row[5] for row in rows]),
     }
     for idx in NUMERIC_COLUMN_INDEXES:
-        summary[f"numeric_col_{idx + 1}_unlabeled_values"] = unique_join([row[idx] for row in rows])
+        summary[KINETIC_COLUMN_VALUE_FIELDS[idx]] = unique_join([row[idx] for row in rows])
     return summary
 
 
@@ -434,11 +441,11 @@ def main() -> int:
         "ec_numbers",
         "reaction_ids",
         "compound_ids",
-        "numeric_col_7_unlabeled_values",
-        "numeric_col_8_unlabeled_values",
-        "numeric_col_9_unlabeled_values",
-        "numeric_col_10_unlabeled_values",
-        "numeric_col_11_unlabeled_values",
+        "kcat_1_per_s_values",
+        "km_mM_values",
+        "kcat_over_km_1_per_mM_s_values",
+        "topt_C_values",
+        "tm_C_values",
         "status",
         "query_method",
         "uniprot_accession",

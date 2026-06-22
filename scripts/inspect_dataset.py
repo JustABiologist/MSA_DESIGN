@@ -22,13 +22,20 @@ ENZYME_COLUMN_NAMES = [
     "reaction_id",
     "ec_numbers",
     "compound_id",
-    "numeric_col_7_unlabeled",
-    "numeric_col_8_unlabeled",
-    "numeric_col_9_unlabeled",
-    "numeric_col_10_unlabeled",
-    "numeric_col_11_unlabeled",
+    "kcat_1_per_s",
+    "km_mM",
+    "kcat_over_km_1_per_mM_s",
+    "topt_C",
+    "tm_C",
 ]
 NUMERIC_COLUMN_INDEXES = range(6, 11)
+NUMERIC_COLUMN_LABELS = {
+    6: "kcat[1/s]",
+    7: "Km[mM]",
+    8: "kcat/Km[1/mM-s]",
+    9: "Topt[°C]",
+    10: "Tm[°C]",
+}
 REACTION_RE = re.compile(r"^R\d{5}$")
 COMPOUND_RE = re.compile(r"^[CG]\d{5}$")
 EC_RE = re.compile(r"^\d+\.(?:\d+|-)\.(?:\d+|-)\.(?:\d+|-)$")
@@ -261,18 +268,20 @@ def main() -> int:
                 print(f"  extra_columns = {parts[EXPECTED_ENZYME_COLUMNS:]}")
 
         print("\nNumeric columns:")
-        print("- Columns 7-11 are unlabeled in the enzyme files.")
         print(
-            "- Current evidence only: columns 7-9 look kinetic-like because they vary by "
-            "compound/reaction and have missing values; columns 10-11 look like temperature "
-            "and pH*10 ranges, but this is unconfirmed."
+            "- Columns 7-11 are named by the web-table header as kcat[1/s], Km[mM], "
+            "kcat/Km[1/mM-s], Topt[°C], and Tm[°C]."
+        )
+        print(
+            "- Note: kcat/Km is kept as the dataset-provided field and is not recomputed "
+            "from the displayed kcat and Km values."
         )
         for idx in NUMERIC_COLUMN_INDEXES:
             stats = numeric_stats[idx]
             missing_pct = (100.0 * stats.missing / stats.total) if stats.total else 0.0
             non_numeric_pct = (100.0 * stats.non_numeric / stats.total) if stats.total else 0.0
             print(
-                f"- column {idx + 1}: total={fmt_int(stats.total)}, "
+                f"- column {idx + 1} ({NUMERIC_COLUMN_LABELS[idx]}): total={fmt_int(stats.total)}, "
                 f"finite={fmt_int(stats.finite)}, missing={fmt_int(stats.missing)} "
                 f"({missing_pct:.2f}%), non_numeric={fmt_int(stats.non_numeric)} "
                 f"({non_numeric_pct:.2f}%), min={fmt_float(stats.minimum)}, "

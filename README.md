@@ -13,7 +13,7 @@ Large local artifacts are intentionally ignored by git:
 
 This repository is for the first assumption-checking step of a sequence-design idea: encode MSAs with MSA Transformer, compress or project latent tensors, condition on enzyme metadata such as substrate, EC, and experimentally validated kinetic parameters when available, then decode or generate candidate sequence variants.
 
-The current scripts do not assume the archive already contains `Km`, `kcat`, or any other named kinetic label. `input_data/enzymes/*.txt` rows have 11 tab-separated columns and no header in the archive. The scripts use conservative working names:
+`input_data/enzymes/*.txt` rows have 11 tab-separated columns and no header in the archive. The matching web-table header identifies the schema as:
 
 1. `gene_id`
 2. `organism_code`
@@ -21,13 +21,13 @@ The current scripts do not assume the archive already contains `Km`, `kcat`, or 
 4. `reaction_id`
 5. `ec_numbers`
 6. `compound_id`
-7. `numeric_col_7_unlabeled`
-8. `numeric_col_8_unlabeled`
-9. `numeric_col_9_unlabeled`
-10. `numeric_col_10_unlabeled`
-11. `numeric_col_11_unlabeled`
+7. `kcat_1_per_s` (`kcat[1/s]`)
+8. `km_mM` (`Km[mM]`)
+9. `kcat_over_km_1_per_mM_s` (`kcat/Km[1/mM-s]`)
+10. `topt_C` (`Topt[°C]`)
+11. `tm_C` (`Tm[°C]`)
 
-Current evidence only: columns 7-9 look kinetic-like because they vary by compound/reaction and have missing values; columns 10-11 look like temperature and pH*10 ranges, but this is unconfirmed. Validate these meanings against the dataset paper, Zenodo documentation, or upstream generation code before using them as supervised labels.
+The `kcat/Km` column is preserved as a dataset-provided value, not recomputed from the displayed `kcat` and `Km` fields. Missing kinetic values appear as `nan` in some rows.
 
 Supplementary files in the zip provide headers for compounds, domains, EC names, gene cross-references, organisms, and reactions. The pipeline reads the zip directly and does not extract the full archive.
 
@@ -81,7 +81,7 @@ The fetcher sleeps between REST calls by default and caches JSON responses under
 
 ## Next Steps
 
-- Confirm the unlabeled numeric columns against primary dataset documentation before treating them as `Km`, `kcat`, temperature, or pH.
+- Cross-check the web-table column labels against primary dataset documentation if exact provenance matters for publication.
 - Decide whether sequence families should be grouped by exact EC, EC prefix, reaction, substrate, organism domain, or combinations of those fields.
 - Require verified KEGG cross-references for production sequence sets, or manually audit unverified fallbacks.
 - Replace the fallback aligner with MAFFT or another production aligner for real training data.
