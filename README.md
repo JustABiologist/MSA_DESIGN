@@ -145,6 +145,33 @@ Each MSA writes `outputs/embeddings/<stem>.npz` plus `outputs/embeddings/<stem>.
 
 A3M lowercase insertion characters and dots are removed before validation. Gaps (`-`) are preserved. MSAs are deterministically cropped to the first `--max-seqs` rows and first `--max-cols` columns, with crop notes recorded in metadata. The next modeling step should consume the pooled arrays or project/compress `token_embeddings` before conditioning on enzyme metadata.
 
+
+## Trainable Predictor Prototype
+
+The first trainable stack lives in `msa_design_model/` and keeps the MSA Transformer boundary frozen:
+
+- `FrozenMSATransformerEncoder` wraps local `fair-esm` MSA Transformer loading, sets all MSAformer parameters to `requires_grad=False`, and exposes an `encode()` method for future end-to-end use.
+- `RowColumnProjector` consumes frozen token embeddings with shape `B x R x L x H`, builds masked row and column context features, fuses `token + row + column`, and projects/pools to an `L x d` matrix per MSA.
+- `NumericConditionTokenBank` has separate numeric embedding heads for `kcat_1_per_s`, `km_mM`, `kcat_over_km_1_per_mM_s`, `topt_C`, and `tm_C`. Missing values use learned missing tokens.
+- `EnzymeMSAPredictor` appends the numeric condition tokens to the projected `L x d` MSA matrix, runs a small trainable Transformer encoder, pools, and predicts a requested numeric target.
+
+Smoke-train the predictor from the precomputed EC-family embeddings:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/train_predictor.py \
+  --epochs 3 \
+  --batch-size 2 \
+  --d-model 64 \
+  --layers 1 \
+  --heads 4 \
+  --device cpu \
+  --out-checkpoint outputs/checkpoints/predictor_smoke.pt
+```
+
+By default, `scripts/train_predictor.py` predicts `kcat_1_per_s` using `outputs/embeddings/ec_*.npz` and matching `outputs/pilot_msas/<stem>.metadata.tsv` rows. Semicolon-separated numeric metadata values are aggregated as the mean of finite values. The target field still has a condition-token slot, but it is masked as missing unless `--include-target-as-condition` is explicitly passed, avoiding target leakage in the default setup.
+
+The saved checkpoint contains only trainable predictor weights and config; MSA Transformer weights remain frozen/precomputed.
+
 ## UniProt Fetching
 
 `fetch_family_sequences.py` first queries UniProt by exact KEGG cross-reference, for example `xref:KEGG-aaa\:Acav_0021`. If that does not return a sequence, it falls back to `gene_exact:<gene_id>`. Metadata TSV output records `kegg_xref_verified=True` only when the selected UniProt record contains the expected KEGG cross-reference such as `aaa:Acav_0021`.
@@ -157,5 +184,5 @@ The fetcher sleeps between REST calls by default and caches JSON responses under
 - Decide whether sequence families should be grouped by exact EC, EC prefix, reaction, substrate, organism domain, or combinations of those fields.
 - Require verified KEGG cross-references for production sequence sets, or manually audit unverified fallbacks.
 - Replace the fallback aligner with MAFFT or another production aligner for real training data.
-- Scale MSA Transformer embedding beyond smoke tests and decide which pooled/token representations feed the projection model.
+- Scale MSA Transformer embedding beyond smoke tests and train/evaluate the predictor with proper family-level splits.
 - Define train/validation splits by homology or family, not random rows, to avoid leakage in downstream design models.
