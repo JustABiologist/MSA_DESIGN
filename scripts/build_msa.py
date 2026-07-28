@@ -46,6 +46,16 @@ def write_fasta(records: list[tuple[str, str]], path: Path) -> None:
                 handle.write(sequence[start : start + FASTA_WRAP] + "\n")
 
 
+def find_executable(name: str) -> str | None:
+    executable = shutil.which(name)
+    if executable is not None:
+        return executable
+    sibling = Path(sys.executable).resolve().parent / name
+    if sibling.exists() and sibling.is_file():
+        return str(sibling)
+    return None
+
+
 def score_pair(left: str, right: str) -> int:
     if left == "-" or right == "-":
         return GAP_SCORE
@@ -186,10 +196,45 @@ def center_star_align(records: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return [(header, sequence) for _, header, sequence in sorted(aligned_by_index)]
 
 
+def run_kalign(input_fasta: Path, output_fasta: Path, mode: str = "fast", threads: int = 0) -> None:
+    kalign = find_executable("kalign")
+    if kalign is None:
+        raise RuntimeError("kalign executable was not found on PATH or next to the active Python")
+    output_fasta.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        kalign,
+        "-i",
+        str(input_fasta),
+        "-o",
+        str(output_fasta),
+        "--format",
+        "fasta",
+        "--type",
+        "protein",
+        "--mode",
+        mode,
+    ]
+    if threads > 0:
+        command.extend(["--nthreads", str(threads)])
+    result = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.stdout:
+        print(result.stdout, file=sys.stdout, end="")
+    if result.stderr:
+        print(result.stderr, file=sys.stderr, end="")
+    if result.returncode != 0:
+        raise RuntimeError(f"kalign failed with exit code {result.returncode}")
+
+
 def run_mafft(input_fasta: Path, output_fasta: Path) -> None:
-    mafft = shutil.which("mafft")
+    mafft = find_executable("mafft")
     if mafft is None:
-        raise RuntimeError("mafft executable was not found on PATH")
+        raise RuntimeError("mafft executable was not found on PATH or next to the active Python")
     output_fasta.parent.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
         [mafft, "--auto", str(input_fasta)],
@@ -211,9 +256,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("output_fasta", help="Output aligned FASTA path.")
     parser.add_argument(
         "--method",
-        choices=["auto", "mafft", "fallback"],
+        choices=["auto", "kalign", "mafft", "fallback"],
         default="auto",
-        help="Alignment method. auto prefers mafft and falls back to pure Python.",
+        help="Alignment method. auto prefers Kalign for speed, then MAFFT, then the pure-Python fallback.",
+    )
+    parser.add_argument(
+        "--kalign-mode",
+        choices=["fast", "default", "recall", "accurate"],
+        default="fast",
+        help="Kalign mode used when --method is kalign or auto selects Kalign.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="Thread count for aligners that support it. Zero lets the aligner choose.",
     )
     return parser.parse_args()
 
@@ -225,9 +282,19 @@ def main() -> int:
     if not input_fasta.exists():
         raise SystemExit(f"Input FASTA not found: {input_fasta}")
 
-    mafft_path = shutil.which("mafft")
+    kalign_path = find_executable("kalign")
+    mafft_path = find_executable("mafft")
+    if args.method == "kalign" and kalign_path is None:
+        raise SystemExit("kalign requested but not found on PATH or next to the active Python")
     if args.method == "mafft" and mafft_path is None:
-        raise SystemExit("mafft requested but not found on PATH")
+        raise SystemExit("mafft requested but not found on PATH or next to the active Python")
+
+    use_kalign = args.method == "kalign" or (args.method == "auto" and kalign_path is not None)
+    if use_kalign:
+        run_kalign(input_fasta, output_fasta, mode=args.kalign_mode, threads=args.threads)
+        print(f"Wrote Kalign alignment to {output_fasta}.")
+        return 0
+
     use_mafft = args.method == "mafft" or (args.method == "auto" and mafft_path is not None)
     if use_mafft:
         run_mafft(input_fasta, output_fasta)
@@ -238,7 +305,7 @@ def main() -> int:
     if not records:
         raise SystemExit(f"No FASTA records found in {input_fasta}")
     print(
-        "WARNING: mafft not available; using deterministic pure-Python center-star "
+        "WARNING: no external aligner available; using deterministic pure-Python center-star "
         "Needleman-Wunsch fallback. This is sufficient for small pilot MSAs only and is "
         "not production-quality.",
         file=sys.stderr,

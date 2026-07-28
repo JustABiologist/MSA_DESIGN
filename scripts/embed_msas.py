@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -37,7 +38,8 @@ def read_fasta_like(path: Path) -> list[tuple[str, str]]:
     records: list[tuple[str, str]] = []
     header: str | None = None
     sequence_parts: list[str] = []
-    with path.open("r", encoding="utf-8") as handle:
+    opener = gzip.open if path.suffix == ".gz" else Path.open
+    with opener(path, "rt", encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
             if not line:
@@ -137,10 +139,12 @@ def contact_regression_path(weights_path: Path) -> Path:
 
 def output_stem(msa_path: Path) -> str:
     name = msa_path.name
-    for suffix in (".msa.fasta", ".msa.fa", ".a3m", ".fasta", ".fa", ".fas"):
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for suffix in (".trimmed.afa", ".msa.fasta", ".msa.fa", ".a3m", ".fasta", ".fa", ".fas", ".afa"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
-    return msa_path.stem
+    return Path(name).stem
 
 
 def find_msa_paths(args: argparse.Namespace) -> list[Path]:

@@ -86,7 +86,7 @@ def run_command(command: list[str]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Choose small early EC families, fetch UniProt sequences, and build pilot MSAs."
+        description="Choose small early EC families, fetch KEGG source sequences, and build pilot MSAs."
     )
     parser.add_argument("--zip", default="data/input_data.zip", help="Path to input_data.zip")
     parser.add_argument("--out-dir", default="outputs/pilot_msas", help="Output directory.")
@@ -109,15 +109,37 @@ def parse_args() -> argparse.Namespace:
         "--sleep-seconds",
         type=float,
         default=0.2,
-        help="Polite delay after UniProt REST requests.",
+        help="Polite delay after KEGG REST requests.",
     )
-    parser.add_argument("--refresh", action="store_true", help="Refresh UniProt cache.")
     parser.add_argument(
-        "--require-kegg-xref",
-        action="store_true",
-        help="Pass through to fetcher: FASTA only for records with verified KEGG xrefs.",
+        "--kegg-root",
+        default="",
+        help="Licensed local KEGG root containing genes/organisms/<org>/<org>.pep files.",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Select families but do not query UniProt.")
+    parser.add_argument(
+        "--sequence-fasta",
+        action="append",
+        default=[],
+        help="Existing KEGG amino-acid FASTA to use before REST. May be repeated.",
+    )
+    parser.add_argument(
+        "--fetch-missing",
+        choices=["none", "rest"],
+        default="rest",
+        help="How to resolve entries missing from local FASTA/local KEGG sources.",
+    )
+    parser.add_argument(
+        "--max-rest-requests",
+        type=int,
+        default=1000,
+        help="Safety cap for uncached KEGG REST batch requests.",
+    )
+    parser.add_argument(
+        "--allow-large-rest-run",
+        action="store_true",
+        help="Allow exceeding --max-rest-requests.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Select families but do not fetch sequences.")
     return parser.parse_args()
 
 
@@ -127,7 +149,7 @@ def main() -> int:
     if not zip_path.exists():
         raise SystemExit(f"Archive not found: {zip_path}")
     script_dir = Path(__file__).resolve().parent
-    fetch_script = script_dir / "fetch_family_sequences.py"
+    fetch_script = script_dir / "remap_kegg_sequences.py"
     build_script = script_dir / "build_msa.py"
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +179,7 @@ def main() -> int:
                 "ec_number",
                 "candidate_gene_count",
                 "fasta",
+                "sequence_index",
                 "metadata",
                 "msa",
                 "fasta_records",
@@ -170,6 +193,7 @@ def main() -> int:
             stem = safe_ec_name(ec_number)
             fasta_path = out_dir / f"{stem}.fasta"
             metadata_path = out_dir / f"{stem}.metadata.tsv"
+            index_path = out_dir / f"{stem}.sequence_index.tsv"
             msa_path = out_dir / f"{stem}.msa.fasta"
 
             fetch_command = [
@@ -187,15 +211,20 @@ def main() -> int:
                 str(args.sleep_seconds),
                 "--out-fasta",
                 str(fasta_path),
+                "--out-index",
+                str(index_path),
                 "--out-metadata",
                 str(metadata_path),
             ]
-            if args.refresh:
-                fetch_command.append("--refresh")
-            if args.require_kegg_xref:
-                fetch_command.append("--require-kegg-xref")
-            if args.dry_run:
-                fetch_command.append("--dry-run")
+            for sequence_fasta in args.sequence_fasta:
+                fetch_command.extend(["--sequence-fasta", sequence_fasta])
+            if args.kegg_root:
+                fetch_command.extend(["--kegg-root", args.kegg_root])
+            fetch_missing = "none" if args.dry_run else args.fetch_missing
+            fetch_command.extend(["--fetch-missing", fetch_missing])
+            fetch_command.extend(["--max-rest-requests", str(args.max_rest_requests)])
+            if args.allow_large_rest_run:
+                fetch_command.append("--allow-large-rest-run")
             run_command(fetch_command)
 
             fasta_records = count_fasta_records(fasta_path)
@@ -213,6 +242,7 @@ def main() -> int:
                     "ec_number": ec_number,
                     "candidate_gene_count": candidate_gene_count,
                     "fasta": str(fasta_path),
+                    "sequence_index": str(index_path),
                     "metadata": str(metadata_path),
                     "msa": str(msa_path) if msa_built == "yes" else "",
                     "fasta_records": fasta_records,

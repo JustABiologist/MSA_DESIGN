@@ -4,16 +4,23 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.python-version
 .venv/
 venv/
 env/
 ENV/
+.env
+.env.*
+.direnv/
 .ipynb_checkpoints/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+build/
+dist/
+*.egg-info/
 
 # OS / editors
 .DS_Store
@@ -28,12 +35,18 @@ Thumbs.db
 tmp/
 temp/
 .cache/
+*.tmp
+*.bak
+*.pid
 
 # Large data and model artifacts
 *.zip
 *.tar
 *.tar.gz
 *.tgz
+*.gz
+*.bz2
+*.xz
 *.pt
 *.pth
 *.ckpt
@@ -41,12 +54,36 @@ temp/
 *.h5
 *.npy
 *.npz
+*.pkl
+*.pickle
+*.joblib
+*.parquet
+*.feather
+*.arrow
+*.db
+*.sqlite
+*.sqlite3
+*.mmap
+*.zarr/
 
+# Training and experiment trackers
+wandb/
+mlruns/
+runs/
+lightning_logs/
+checkpoints/
+
+# Local data, generated outputs, model weights, and vendored tools
 data/*
 weights/*
 outputs/*
+tools/*
 
-# Keep directory placeholders
+# Keep directory placeholders / ignore sentinels
 !data/.gitkeep
+!data/.gitignore
 !weights/.gitkeep
+!weights/.gitignore
 !outputs/.gitkeep
+!outputs/.gitignore
+!tools/.gitignore

@@ -1,0 +1,3 @@
+# Keep downloaded or built third-party tools out of git.
+*
+!.gitignore

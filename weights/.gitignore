@@ -1,0 +1,4 @@
+# Keep downloaded model weights and checkpoints out of git.
+*
+!.gitignore
+!.gitkeep

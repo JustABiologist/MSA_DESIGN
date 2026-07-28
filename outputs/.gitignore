@@ -1,0 +1,4 @@
+# Keep generated alignments, embeddings, logs, checkpoints, and reports out of git.
+*
+!.gitignore
+!.gitkeep

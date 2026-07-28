@@ -1,0 +1,4 @@
+# Keep local datasets, archives, caches, and generated indices out of git.
+*
+!.gitignore
+!.gitkeep
