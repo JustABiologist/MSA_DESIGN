@@ -32,6 +32,24 @@ Inputs per training example:
 - Optional target-row ESM-MSA residue embeddings, extracted before masking and
   used only as continuous supervision.
 
+CCDD wording in this repo is precise:
+
+- The active mean-start trainer is CCDD-inspired dual supervision, not a full
+  paper-faithful latent+token co-diffusion loop. The sequence stream starts from
+  mean or noisy-mean amino-acid embeddings and predicts residue tokens with CE.
+- In `--continuous-target-mode target_row_embedding`, the same decoder states
+  also predict the hidden target row's frozen ESM-MSA per-residue embeddings
+  with an MSE-style continuous loss. This is the "latent" side of the current
+  run.
+- Those target-row continuous embeddings are not provided as conditioning
+  memory and are not allowed to leak through the MSA grid. They are extracted
+  before target-row masking only so they can serve as the supervised target.
+- The older `scripts/train_sequence_decoder.py` path contains the more explicit
+  CCDD-lite experiment: discrete absorbing-mask corruption plus a noised
+  continuous target stream, with masked discrete positions erased in the
+  continuous stream before Gaussian noising. That path is kept as a legacy
+  baseline, while current large runs use `train_mean_start_ccdd_from_cached_msas.py`.
+
 Leakage controls:
 
 - Target row(s) are removed from the profile before profile construction.
