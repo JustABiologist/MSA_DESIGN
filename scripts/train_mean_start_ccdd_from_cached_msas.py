@@ -55,7 +55,7 @@ AA_TOKENS = "ACDEFGHIKLMNPQRSTVWY"
 AA_TO_COL = {aa: idx for idx, aa in enumerate(AA_TOKENS)}
 ALLOWED_TARGET_TOKENS = set(AA_TOKENS)
 NUMERIC_FIELDS = ("kcat_1_per_s", "km_mM", "kcat_over_km_1_per_mM_s", "topt_C", "tm_C")
-CATEGORICAL_FIELDS = ("domain", "reaction_id", "ec_numbers", "compound_id")
+CATEGORICAL_FIELDS = ("domain", "reaction_id", "ec_numbers", "compound_id", "organism_code")
 LOG_NUMERIC_FIELDS = {"kcat_1_per_s", "km_mM", "kcat_over_km_1_per_mM_s"}
 RAW_PROFILE_DIM = len(AA_TOKENS) + 2
 PROFILE_DIM = RAW_PROFILE_DIM
@@ -145,6 +145,13 @@ def split_values(text: str) -> tuple[str, ...]:
         if value and value.lower() != "nan":
             values.append(value)
     return tuple(dict.fromkeys(values))
+
+
+def categorical_values(row: dict[str, str], field: str) -> tuple[str, ...]:
+    values = split_values(row.get(f"{field}_values", ""))
+    if values:
+        return values
+    return split_values(row.get(field, ""))
 
 
 def stable_hash(text: str, buckets: int) -> int:
@@ -344,7 +351,7 @@ def condition_features(
     category_ids = np.full((len(CATEGORICAL_FIELDS),), -1, dtype=np.int64)
     category_mask = np.zeros((len(CATEGORICAL_FIELDS),), dtype=np.bool_)
     for idx, field in enumerate(CATEGORICAL_FIELDS):
-        values = split_values(row.get(f"{field}_values", ""))
+        values = categorical_values(row, field)
         if values:
             joined = "|".join(values)
             category_ids[idx] = stable_hash(f"{field}:{joined}", category_buckets)
@@ -424,6 +431,32 @@ def target_row_residue_embeddings(
     target_length = min(len(target_sequence), residue_embeddings.shape[0])
     embeddings = residue_embeddings[:target_length]
     mask = np.ones((target_length,), dtype=np.bool_)
+    return embeddings, mask
+
+
+def single_row_msa_context(
+    item: dict[str, Any],
+    row_index: int,
+    length: int,
+    gap_inclusive_mask: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    if "token_embeddings" not in item:
+        raise RuntimeError(
+            f"{item.get('npz_path', 'embedding NPZ')} does not contain token_embeddings; "
+            "precompute ESM-MSA embeddings with --store-token-embeddings for mixed MSA context rows"
+        )
+    token_embeddings = item["token_embeddings"]
+    aa_mask = item["aa_mask"]
+    sequences = item["sequences"]
+    row_count = min(token_embeddings.shape[0], len(sequences))
+    if not 0 <= row_index < row_count:
+        raise IndexError(f"row_index={row_index} outside token embedding rows={row_count}")
+    col_count = min(length, len(sequences[row_index]), token_embeddings.shape[1], aa_mask.shape[1])
+    embeddings = token_embeddings[row_index, :col_count]
+    if gap_inclusive_mask:
+        mask = np.ones((col_count,), dtype=np.bool_)
+    else:
+        mask = aa_mask[row_index, :col_count]
     return embeddings, mask
 
 
@@ -858,6 +891,195 @@ class CachedMSAMaskedRowsDataset(Dataset[list[dict[str, Any]]]):
                 }
             )
         return outputs
+
+
+class CachedMSAMixedContextDataset(Dataset[dict[str, Any]]):
+    def __init__(
+        self,
+        examples: list[RowExample],
+        context_groups: list[list[RowExample]],
+        labels: dict[str, dict[str, str]],
+        numeric_means: dict[str, float],
+        numeric_stds: dict[str, float],
+        category_buckets: int,
+        cache_size: int,
+        consensus_loss_mode: str,
+        consensus_match_weight: float,
+        nonconsensus_weight: float,
+        unobserved_nonconsensus_weight: float,
+        max_sequence_loss_weight: float,
+        variable_column_min_entropy: float,
+        variable_column_max_consensus: float,
+        mixed_msa_context_rows: int,
+        require_msa_embeddings: bool,
+        msa_embedding_dtype: str,
+        max_msa_context_rows: int | None,
+        gap_inclusive_msa_mask: bool,
+        require_target_continuous_embeddings: bool = False,
+    ) -> None:
+        self.examples = examples
+        self.context_groups = context_groups
+        self.labels = labels
+        self.numeric_means = numeric_means
+        self.numeric_stds = numeric_stds
+        self.category_buckets = category_buckets
+        self.store = CachedMSAStore(cache_size=cache_size, msa_embedding_dtype=msa_embedding_dtype)
+        self.consensus_loss_mode = consensus_loss_mode
+        self.consensus_match_weight = consensus_match_weight
+        self.nonconsensus_weight = nonconsensus_weight
+        self.unobserved_nonconsensus_weight = unobserved_nonconsensus_weight
+        self.max_sequence_loss_weight = max_sequence_loss_weight
+        self.variable_column_min_entropy = variable_column_min_entropy
+        self.variable_column_max_consensus = variable_column_max_consensus
+        self.mixed_msa_context_rows = mixed_msa_context_rows
+        self.require_msa_embeddings = require_msa_embeddings
+        self.require_target_continuous_embeddings = require_target_continuous_embeddings
+        self.max_msa_context_rows = max_msa_context_rows
+        self.gap_inclusive_msa_mask = gap_inclusive_msa_mask
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def _sample_context_groups(self, target: RowExample) -> list[list[RowExample]]:
+        candidates = [
+            group
+            for group in self.context_groups
+            if group and group[0].npz_path != target.npz_path and group[0].cluster_index != target.cluster_index
+        ]
+        if len(candidates) < self.mixed_msa_context_rows:
+            raise RuntimeError(
+                f"requested {self.mixed_msa_context_rows} mixed MSA context rows, "
+                f"but only {len(candidates)} different MSA groups are available"
+            )
+        return random.sample(candidates, self.mixed_msa_context_rows)
+
+    def _mixed_context(
+        self,
+        target: RowExample,
+        length: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.require_msa_embeddings:
+            return (
+                np.zeros((0, length, 1), dtype=np.float32),
+                np.zeros((0, length), dtype=np.bool_),
+                np.zeros((0, 1), dtype=np.float32),
+            )
+
+        context_embeddings: list[np.ndarray] = []
+        context_masks: list[np.ndarray] = []
+        context_row_embeddings: list[np.ndarray] = []
+        for group in self._sample_context_groups(target):
+            source_item = self.store.load(group[0].npz_path, group[0].metadata_path)
+            source_sequences = source_item["sequences"]
+            source_row_count = min(source_item["token_embeddings"].shape[0], len(source_sequences))
+            eligible = [example for example in group if 0 <= example.row_index < source_row_count]
+            if not eligible:
+                continue
+            source = random.choice(eligible)
+            row_embeddings = source_item["row_embeddings"]
+            row_count = min(row_embeddings.shape[0], source_row_count)
+            if source.row_index >= row_count:
+                continue
+            embeddings, mask = single_row_msa_context(
+                source_item,
+                source.row_index,
+                length,
+                gap_inclusive_mask=self.gap_inclusive_msa_mask,
+            )
+            if embeddings.shape[0] == 0:
+                continue
+            context_embeddings.append(embeddings)
+            context_masks.append(mask)
+            context_row_embeddings.append(row_embeddings[source.row_index].astype(np.float32))
+
+        if len(context_embeddings) != self.mixed_msa_context_rows:
+            raise RuntimeError(
+                f"sampled {len(context_embeddings)} valid mixed MSA context rows; "
+                f"expected {self.mixed_msa_context_rows}"
+            )
+
+        if self.max_msa_context_rows is not None:
+            context_limit = min(self.max_msa_context_rows, len(context_embeddings))
+            keep = sorted(random.sample(range(len(context_embeddings)), context_limit))
+            context_embeddings = [context_embeddings[idx] for idx in keep]
+            context_masks = [context_masks[idx] for idx in keep]
+            context_row_embeddings = [context_row_embeddings[idx] for idx in keep]
+
+        msa_embedding_dim = context_embeddings[0].shape[-1]
+        msa_embedding_dtype = (
+            context_embeddings[0].dtype
+            if np.issubdtype(context_embeddings[0].dtype, np.floating)
+            else np.float32
+        )
+        row_embedding_dim = context_row_embeddings[0].shape[-1]
+        mixed_embeddings = np.zeros(
+            (len(context_embeddings), length, msa_embedding_dim),
+            dtype=msa_embedding_dtype,
+        )
+        mixed_mask = np.zeros((len(context_embeddings), length), dtype=np.bool_)
+        mixed_row_embeddings = np.zeros((len(context_row_embeddings), row_embedding_dim), dtype=np.float32)
+        for idx, (embeddings, mask, row_embedding) in enumerate(
+            zip(context_embeddings, context_masks, context_row_embeddings)
+        ):
+            col_count = min(length, embeddings.shape[0])
+            mixed_embeddings[idx, :col_count] = embeddings[:col_count]
+            mixed_mask[idx, :col_count] = mask[:col_count]
+            mixed_row_embeddings[idx] = row_embedding
+        return mixed_embeddings, mixed_mask, mixed_row_embeddings
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        example = self.examples[index]
+        item = self.store.load(example.npz_path, example.metadata_path)
+        sequences = item["sequences"]
+        if example.row_index >= len(sequences):
+            raise IndexError(f"row_index={example.row_index} outside MSA with {len(sequences)} rows")
+        length = len(sequences[example.row_index])
+        profile = profile_excluding_row(sequences, example.row_index, length)
+        msa_embeddings, msa_embedding_mask, non_target_rows = self._mixed_context(example, length)
+        if self.require_target_continuous_embeddings:
+            target_continuous_embeddings, target_continuous_mask = target_row_residue_embeddings(
+                item,
+                example.row_index,
+                example.target_sequence,
+            )
+        else:
+            target_continuous_embeddings = np.zeros((0, 1), dtype=np.float32)
+            target_continuous_mask = np.zeros((0,), dtype=np.bool_)
+        consensus_features = consensus_training_features(
+            profile=profile,
+            aligned_target=sequences[example.row_index],
+            consensus_loss_mode=self.consensus_loss_mode,
+            consensus_match_weight=self.consensus_match_weight,
+            nonconsensus_weight=self.nonconsensus_weight,
+            unobserved_nonconsensus_weight=self.unobserved_nonconsensus_weight,
+            max_sequence_loss_weight=self.max_sequence_loss_weight,
+            variable_column_min_entropy=self.variable_column_min_entropy,
+            variable_column_max_consensus=self.variable_column_max_consensus,
+        )
+        numeric_values, numeric_mask, category_ids, category_mask = condition_features(
+            self.labels,
+            example.kegg_entry,
+            self.numeric_means,
+            self.numeric_stds,
+            self.category_buckets,
+        )
+        return {
+            "profile": profile,
+            "msa_embeddings": msa_embeddings,
+            "msa_embedding_mask": msa_embedding_mask,
+            **consensus_features,
+            "row_embeddings": non_target_rows,
+            "target_continuous_embeddings": target_continuous_embeddings,
+            "target_continuous_mask": target_continuous_mask,
+            "target_sequence": example.target_sequence,
+            "numeric_values": numeric_values,
+            "numeric_mask": numeric_mask,
+            "category_ids": category_ids,
+            "category_mask": category_mask,
+            "cluster_index": example.cluster_index,
+            "kegg_entry": example.kegg_entry,
+            "row_index": example.row_index,
+        }
 
 
 class RowReconstructionCollator:
@@ -1889,6 +2111,15 @@ def parse_args() -> argparse.Namespace:
         help="Randomly subsample non-target MSA token-memory context rows to this depth.",
     )
     parser.add_argument(
+        "--mixed-msa-context-rows",
+        type=int,
+        default=0,
+        help=(
+            "If >0, replace each target's axial MSA grid with this many single rows sampled "
+            "from different MSA groups. Intended for harder profile_msa_axial training."
+        ),
+    )
+    parser.add_argument(
         "--masked-rows-per-msa-min",
         type=int,
         default=1,
@@ -2082,6 +2313,13 @@ def main() -> int:
         raise SystemExit("--masked-rows-per-msa-max must be >= --masked-rows-per-msa-min")
     if args.max_msa_context_rows is not None and args.max_msa_context_rows < 1:
         raise SystemExit("--max-msa-context-rows must be >= 1")
+    if args.mixed_msa_context_rows < 0:
+        raise SystemExit("--mixed-msa-context-rows must be >= 0")
+    if args.mixed_msa_context_rows > 0:
+        if not uses_axial_msa_memory(args.memory_mode):
+            raise SystemExit("--mixed-msa-context-rows requires --memory-mode profile_msa_axial")
+        if args.masked_rows_per_msa_min != 1 or args.masked_rows_per_msa_max != 1:
+            raise SystemExit("--mixed-msa-context-rows currently requires masked rows per MSA 1:1")
     if args.msa_axial_layers < 1:
         raise SystemExit("--msa-axial-layers must be >= 1")
     if args.profile_feature_mode != "full" and (args.profile_variable_dropout > 0.0 or args.profile_variable_blur > 0.0):
@@ -2147,8 +2385,24 @@ def main() -> int:
         "max_msa_context_rows": args.max_msa_context_rows,
         "gap_inclusive_msa_mask": uses_gap_inclusive_msa_mask(args.memory_mode),
     }
-    grouped_target_mode = args.masked_rows_per_msa_max > 1
-    if grouped_target_mode:
+    mixed_msa_context_mode = args.mixed_msa_context_rows > 0
+    grouped_target_mode = (not mixed_msa_context_mode) and args.masked_rows_per_msa_max > 1
+    if mixed_msa_context_mode:
+        train_groups = build_msa_groups(train_examples)
+        val_groups = build_msa_groups(val_examples)
+        train_dataset = CachedMSAMixedContextDataset(
+            train_examples,
+            train_groups,
+            mixed_msa_context_rows=args.mixed_msa_context_rows,
+            **dataset_kwargs,
+        )
+        val_dataset = CachedMSAMixedContextDataset(
+            val_examples,
+            val_groups,
+            mixed_msa_context_rows=args.mixed_msa_context_rows,
+            **dataset_kwargs,
+        )
+    elif grouped_target_mode:
         train_groups = build_msa_groups(train_examples)
         val_groups = build_msa_groups(val_examples)
         train_dataset = CachedMSAMaskedRowsDataset(
@@ -2316,7 +2570,16 @@ def main() -> int:
             "path_rewrites=" + ",".join(f"{old}=>{new}" for old, new in path_rewrites),
             flush=True,
         )
-    if grouped_target_mode:
+    if mixed_msa_context_mode:
+        print(
+            f"mixed_msa_context_mode=1 train_msa_groups={len(train_groups):,} val_msa_groups={len(val_groups):,} "
+            f"mixed_msa_context_rows={args.mixed_msa_context_rows} "
+            f"max_msa_context_rows={args.max_msa_context_rows} "
+            "each target uses a static axial MSA grid assembled from one row from each sampled different MSA group; "
+            "the target MSA is excluded from that grid",
+            flush=True,
+        )
+    elif grouped_target_mode:
         print(
             f"grouped_target_mode=1 train_msa_groups={len(train_groups):,} val_msa_groups={len(val_groups):,} "
             f"masked_rows_per_msa={args.masked_rows_per_msa_min}:{args.masked_rows_per_msa_max} "
@@ -2357,7 +2620,8 @@ def main() -> int:
         "leakage_control=target row(s) are excluded from profile, cached ESM-MSA token memory, and row-memory; "
         "target-row residue embeddings are used only as continuous targets when requested; "
         "cached col_embeddings are not used; profile_msa_axial keeps a gap-inclusive target-masked MSA grid static "
-        "and lets only decoder latents cross-attend directly over static MSA column cells and row cells every layer",
+        "and lets only decoder latents cross-attend directly over static MSA column cells and row cells every layer; "
+        "mixed-MSA context mode excludes the target MSA from the static axial grid",
         flush=True,
     )
 

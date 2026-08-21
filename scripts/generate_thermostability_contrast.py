@@ -27,6 +27,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from msa_design_model import batch_encode_sequences_with_stop, decode_tokens_until_stop  # noqa: E402
 from train_mean_start_ccdd_from_cached_msas import (  # noqa: E402
+    AMP_MODES,
     CATEGORICAL_FIELDS,
     MSA_EMBEDDING_DTYPES,
     NUMERIC_FIELDS,
@@ -35,8 +36,10 @@ from train_mean_start_ccdd_from_cached_msas import (  # noqa: E402
     RowExample,
     RowReconstructionCollator,
     open_text,
+    autocast_context,
     parse_float,
     rewrite_manifest_path,
+    stable_hash,
     transform_numeric,
     uses_msa_embedding_memory,
     uses_gap_inclusive_msa_mask,
@@ -210,36 +213,56 @@ def set_numeric_override(
     return output
 
 
+def set_category_override(
+    batch: dict[str, Any],
+    category_buckets: int,
+    overrides: dict[str, str],
+) -> dict[str, Any]:
+    output = dict(batch)
+    category_ids = batch["category_ids"].clone()
+    category_mask = batch["category_mask"].clone()
+    for field, value in overrides.items():
+        if field not in CATEGORICAL_FIELDS:
+            raise ValueError(f"unknown categorical condition field: {field}")
+        idx = CATEGORICAL_FIELDS.index(field)
+        category_ids[0, idx] = stable_hash(f"{field}:{value}", category_buckets)
+        category_mask[0, idx] = True
+    output["category_ids"] = category_ids
+    output["category_mask"] = category_mask
+    return output
+
+
 def move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
 
 
 @torch.no_grad()
-def mean_decode(model: MeanStartCCDDModel, batch: dict[str, Any], device: torch.device) -> str:
+def mean_decode(model: MeanStartCCDDModel, batch: dict[str, Any], device: torch.device, amp_mode: str) -> str:
     model.eval()
     moved = move_batch(batch, device)
     timesteps = torch.zeros((moved["target_tokens"].shape[0],), dtype=torch.long, device=device)
-    outputs = model(
-        profiles=moved["profiles"],
-        profile_mask=moved["profile_mask"],
-        row_embeddings=moved["row_embeddings"],
-        row_mask=moved["row_mask"],
-        msa_embeddings=moved["msa_embeddings"],
-        msa_embedding_mask=moved["msa_embedding_mask"],
-        numeric_values=moved["numeric_values"],
-        numeric_mask=moved["numeric_mask"],
-        category_ids=moved["category_ids"],
-        category_mask=moved["category_mask"],
-        target_tokens=moved["target_tokens"],
-        loss_weights=moved["loss_weights"],
-        sequence_loss_weights=moved.get("sequence_loss_weights"),
-        target_continuous_embeddings=moved.get("target_continuous_embeddings"),
-        target_continuous_mask=moved.get("target_continuous_mask"),
-        timesteps=timesteps,
-        decoder_start_mode="mean",
-        memory_dropout=0.0,
-        profile_variable_mask=moved.get("profile_variable_mask"),
-    )
+    with autocast_context(device, amp_mode):
+        outputs = model(
+            profiles=moved["profiles"],
+            profile_mask=moved["profile_mask"],
+            row_embeddings=moved["row_embeddings"],
+            row_mask=moved["row_mask"],
+            msa_embeddings=moved["msa_embeddings"],
+            msa_embedding_mask=moved["msa_embedding_mask"],
+            numeric_values=moved["numeric_values"],
+            numeric_mask=moved["numeric_mask"],
+            category_ids=moved["category_ids"],
+            category_mask=moved["category_mask"],
+            target_tokens=moved["target_tokens"],
+            loss_weights=moved["loss_weights"],
+            sequence_loss_weights=moved.get("sequence_loss_weights"),
+            target_continuous_embeddings=moved.get("target_continuous_embeddings"),
+            target_continuous_mask=moved.get("target_continuous_mask"),
+            timesteps=timesteps,
+            decoder_start_mode="mean",
+            memory_dropout=0.0,
+            profile_variable_mask=moved.get("profile_variable_mask"),
+        )
     predicted = torch.argmax(outputs["logits"], dim=-1).detach().cpu()
     return decode_tokens_until_stop(predicted[0].tolist())
 
@@ -366,6 +389,24 @@ def parse_path_rewrites(values: list[str]) -> list[tuple[str, str]]:
     return rewrites
 
 
+def parse_category_overrides(values: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"--category-override must be FIELD=VALUE, got {value!r}")
+        field, raw = value.split("=", 1)
+        field = field.strip()
+        raw = raw.strip()
+        if field not in CATEGORICAL_FIELDS:
+            raise SystemExit(
+                f"unknown categorical field {field!r}; expected one of {', '.join(CATEGORICAL_FIELDS)}"
+            )
+        if not raw:
+            raise SystemExit(f"--category-override has empty value for {field!r}")
+        overrides[field] = raw
+    return overrides
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
@@ -387,6 +428,12 @@ def parse_args() -> argparse.Namespace:
         help="Dtype for cached token_embeddings; defaults to checkpoint config.",
     )
     parser.add_argument(
+        "--amp",
+        choices=("checkpoint", *AMP_MODES),
+        default="checkpoint",
+        help="Autocast mode for model forward. By default, reuse the checkpoint config.",
+    )
+    parser.add_argument(
         "--max-msa-context-rows",
         type=int,
         default=None,
@@ -397,6 +444,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-original-tm", type=float, default=62.0)
     parser.add_argument("--thermo-topt", type=float, default=68.0)
     parser.add_argument("--thermo-tm", type=float, default=78.0)
+    parser.add_argument(
+        "--category-override",
+        action="append",
+        default=[],
+        help=(
+            "Override a categorical condition token with FIELD=VALUE, for example "
+            "organism_code=eco."
+        ),
+    )
     parser.add_argument("--max-candidates", type=int, default=20000)
     parser.add_argument("--seed", type=int, default=1729)
     return parser.parse_args()
@@ -423,7 +479,9 @@ def main() -> int:
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint["config"]
+    amp_mode = str(config.get("amp", "off")) if args.amp == "checkpoint" else args.amp
     path_rewrites = parse_path_rewrites(args.path_rewrite)
+    category_overrides = parse_category_overrides(args.category_override)
     labels = load_labels(Path(args.label_summary))
     embeddings = read_embedding_manifest(Path(args.embedding_manifest), path_rewrites=path_rewrites)
     candidate = find_candidate(
@@ -525,8 +583,19 @@ def main() -> int:
         checkpoint["numeric_stds"],
         thermo_overrides,
     )
-    baseline_sequence = mean_decode(model, baseline_batch, device)
-    thermo_sequence = mean_decode(model, thermo_batch, device)
+    if category_overrides:
+        baseline_batch = set_category_override(
+            baseline_batch,
+            int(config["category_buckets"]),
+            category_overrides,
+        )
+        thermo_batch = set_category_override(
+            thermo_batch,
+            int(config["category_buckets"]),
+            category_overrides,
+        )
+    baseline_sequence = mean_decode(model, baseline_batch, device, amp_mode)
+    thermo_sequence = mean_decode(model, thermo_batch, device, amp_mode)
     variant_identity = identity(baseline_sequence, thermo_sequence)
     target_baseline_identity = identity(candidate.target_sequence, baseline_sequence)
     target_thermo_identity = identity(candidate.target_sequence, thermo_sequence)
@@ -545,6 +614,7 @@ def main() -> int:
         "variant_identity": variant_identity,
         "target_baseline_identity": target_baseline_identity,
         "target_thermo_identity": target_thermo_identity,
+        "category_overrides": category_overrides,
         "note": "Current checkpoint has no pH optimum condition. kcat is held fixed by using the same normalized kcat condition for both variants.",
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -553,12 +623,14 @@ def main() -> int:
         [
             (
                 f"baseline kegg={candidate.kegg_entry} cluster={candidate.cluster_index} "
-                f"kcat={candidate.kcat:.6g} topt={candidate.topt:.1f} tm={candidate.tm:.1f}",
+                f"kcat={candidate.kcat:.6g} topt={candidate.topt:.1f} tm={candidate.tm:.1f} "
+                f"categories={category_overrides}",
                 baseline_sequence,
             ),
             (
                 f"thermostable kegg={candidate.kegg_entry} cluster={candidate.cluster_index} "
-                f"kcat={candidate.kcat:.6g} topt={args.thermo_topt:.1f} tm={args.thermo_tm:.1f}",
+                f"kcat={candidate.kcat:.6g} topt={args.thermo_topt:.1f} tm={args.thermo_tm:.1f} "
+                f"categories={category_overrides}",
                 thermo_sequence,
             ),
             (

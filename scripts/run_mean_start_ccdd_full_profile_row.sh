@@ -39,6 +39,7 @@ MSA_EMBEDDING_DTYPE="${MSA_EMBEDDING_DTYPE:-float32}"
 AMP="${AMP:-off}"
 MSA_AXIAL_LAYERS="${MSA_AXIAL_LAYERS:-1}"
 MAX_MSA_CONTEXT_ROWS="${MAX_MSA_CONTEXT_ROWS:-}"
+MIXED_MSA_CONTEXT_ROWS="${MIXED_MSA_CONTEXT_ROWS:-0}"
 CACHE_SIZE="${CACHE_SIZE:-128}"
 VAL_BATCHES="${VAL_BATCHES:-64}"
 CHECKPOINT_EVERY_STEPS="${CHECKPOINT_EVERY_STEPS:-1000}"
@@ -104,6 +105,7 @@ echo "msa_embedding_dtype=${MSA_EMBEDDING_DTYPE}"
 echo "amp=${AMP}"
 echo "msa_axial_layers=${MSA_AXIAL_LAYERS}"
 echo "max_msa_context_rows=${MAX_MSA_CONTEXT_ROWS}"
+echo "mixed_msa_context_rows=${MIXED_MSA_CONTEXT_ROWS}"
 echo "cache_size=${CACHE_SIZE}"
 echo "val_batches=${VAL_BATCHES}"
 echo "checkpoint_every_steps=${CHECKPOINT_EVERY_STEPS}"
@@ -152,6 +154,7 @@ CMD=(
   --amp "${AMP}" \
   --masked-rows-per-msa-min "${MASKED_ROWS_PER_MSA_MIN}" \
   --masked-rows-per-msa-max "${MASKED_ROWS_PER_MSA_MAX}" \
+  --mixed-msa-context-rows "${MIXED_MSA_CONTEXT_ROWS}" \
   --log-every-steps 25 \
   --eval-every-steps 500 \
   --val-batches "${VAL_BATCHES}" \

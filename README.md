@@ -1,45 +1,112 @@
 # MSA_DESIGN
 
-Small reproducible bootstrap for checking assumptions in the Zenodo enzyme dataset, remapping GotEnzymes rows to their source KEGG protein sequences, and building pilot multiple sequence alignments by EC family.
+MSA_DESIGN is the local research stack for enzyme sequence design from frozen
+ESM-MSA embeddings and GotEnzymes reaction metadata. The current workhorse is a
+mean-start CCDD-style target-row reconstruction model that keeps a
+target-masked MSA token grid static and lets only the sequence decoder latents
+read from it.
 
-Large local artifacts are intentionally ignored by git:
+The older pilot scripts are still useful for data checks and baselines, but the
+active architecture is `profile_msa_axial` in
+`scripts/train_mean_start_ccdd_from_cached_msas.py`.
 
-- `data/input_data.zip` from Zenodo record 17376050
-- `data/cache/kegg_aaseq/` KEGG REST amino-acid FASTA cache files
-- `data/cache/uniprot/` legacy UniProt REST JSON cache files
-- `outputs/pilot_msas/` FASTA, metadata TSV, and MSA pilot outputs
-- `outputs/embeddings/` MSA Transformer `.npz` tensors and metadata JSON files
-- `weights/esm_msa1b_t12_100M_UR50S.pt`, ESM MSA Transformer weights
-- `weights/esm_msa1b_t12_100M_UR50S-contact-regression.pt`, tiny `fair-esm` sidecar expected by local model loading
+## Current Architecture
 
-## Data Framing
+The active model reconstructs one or more hidden target rows from an enzyme MSA
+under numeric and categorical enzyme conditions.
 
-This repository is for the first assumption-checking step of a sequence-design idea: encode MSAs with MSA Transformer, compress or project latent tensors, condition on enzyme metadata such as substrate, EC, and experimentally validated kinetic parameters when available, then decode or generate candidate sequence variants.
+Inputs per training example:
 
-`input_data/enzymes/*.txt` rows have 11 tab-separated columns and no header in the archive. The matching web-table header identifies the schema as:
+- A target protein sequence encoded as residues, one `*` STOP token, then low
+  weight trailing `*` padding.
+- A leave-one-target-row-out profile built from the remaining aligned rows.
+  Current high-signal runs usually use `--profile-feature-mode no_aa_frequency`,
+  which removes amino-acid frequencies and keeps only gap/coverage channels.
+- Numeric condition fields: `kcat_1_per_s`, `km_mM`,
+  `kcat_over_km_1_per_mM_s`, `topt_C`, and `tm_C`.
+- Categorical condition fields used by the current mean-start trainer:
+  `domain`, `reaction_id`, `ec_numbers`, `compound_id`, and `organism_code`.
+- Cached ESM-MSA token embeddings for the retained MSA rows, shaped
+  `rows x aligned_columns x 768`. The active token cache is
+  `esm_msa_token_embeddings_col/embedding_manifest.tsv`.
+- Optional target-row ESM-MSA residue embeddings, extracted before masking and
+  used only as continuous supervision.
 
-1. `gene_id`
-2. `organism_code`
-3. `domain`
-4. `reaction_id`
-5. `ec_numbers`
-6. `compound_id`
-7. `kcat_1_per_s` (`kcat[1/s]`)
-8. `km_mM` (`Km[mM]`)
-9. `kcat_over_km_1_per_mM_s` (`kcat/Km[1/mM-s]`)
-10. `topt_C` (`Topt[°C]`)
-11. `tm_C` (`Tm[°C]`)
+Leakage controls:
 
-The `kcat/Km` column is preserved as a dataset-provided value, not recomputed from the displayed `kcat` and `Km` fields. Missing kinetic values appear as `nan` in some rows.
+- Target row(s) are removed from the profile before profile construction.
+- Target row(s) are removed from cached ESM-MSA token-grid memory.
+- Target row(s) are removed from row-memory paths in legacy modes.
+- Cached `col_embeddings` are not used in the active `profile_msa_axial` path.
+- Target-row residue embeddings are allowed only as the continuous target when
+  `--continuous-target-mode target_row_embedding` is selected.
 
-Supplementary files in the zip provide headers for compounds, domains, EC names, gene cross-references, organisms, and reactions. The pipeline reads the zip directly and does not extract the full archive.
+Decoder flow per `SequenceMSAAxialDecoderLayer`:
 
-GotEnzymes mined its prediction inputs from KEGG, including per-organism protein sequences, compound structures, and EC/reaction associations. The correct primary sequence identifier for an enzyme row is therefore the KEGG gene entry `organism_code:gene_id`, for example `aaa:Acav_0021`. UniProt accessions in `input_data/supplementary/gene.txt` are cross-references, not the primary sequence key for this dataset.
+1. Self-attention over the sequence decoder latents.
+2. Cross-attention from sequence latents into static condition/profile memory.
+3. Direct same-column MSA read: decoder position `i` attends to all retained
+   MSA row cells at aligned column `i`.
+4. Direct whole-row MSA read: decoder latents attend over every retained MSA row
+   sequence, then fuse row-specific updates with attention.
+5. Feed-forward update on the sequence latents.
 
+The MSA grid is read-only in this path. The layer returns `sequence, msa_grid`,
+with `msa_grid` unchanged. Do not replace these direct column and row reads with
+pooled row/column summaries unless that is the experiment being tested.
 
-## Dedicated Conda Environment
+Grouped-target mode reconstructs 4 to 5 rows from one MSA while sharing the
+heavy MSA grid. The collator emits one shared grid per MSA group plus
+`target_msa_group_indices`; each target keeps its own condition/profile tensors
+while `_column_read` and `_row_read` index into the shared static grid.
 
-A separate CUDA-enabled conda environment is defined in `environment.yml` and has been created locally as `msa_design` under Miniforge:
+Mixed-MSA context mode is a harder negative-control style experiment. When
+`--mixed-msa-context-rows N` is set, each target uses a static axial grid
+assembled from one row sampled from each of `N` different MSA groups. The target
+MSA is excluded from that grid, and this mode currently requires
+`--masked-rows-per-msa-min 1 --masked-rows-per-msa-max 1`.
+
+## Data And Artifacts
+
+Large data, model weights, checkpoints, and generated outputs are intentionally
+ignored by Git. Important local artifacts:
+
+- `data/input_data.zip`, Zenodo GotEnzymes archive.
+- `weights/esm_msa1b_t12_100M_UR50S.pt`, local ESM-MSA-1b weights.
+- `weights/esm_msa1b_t12_100M_UR50S-contact-regression.pt`, the small
+  `fair-esm` sidecar expected by local loading.
+- `/mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim/`, the
+  canonical training root encoded in manifests.
+- On this workstation the same root is often mounted at
+  `/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/`.
+  Launchers set a `/mnt/backup4TB=...` path rewrite automatically when
+  `DATA_ROOT` points at the `/media/...` mount.
+
+The current low-gap UniProt-backed training MSA set contains:
+
+- 31,727 successful heavily gap-trimmed MSAs from 33,194 input clusters.
+- 1,915,502 kept sequences.
+- 13,741,668 retained reaction-parameter rows.
+- Mean raw gap fraction 0.121171 and mean trimmed gap fraction 0.004481.
+
+Key files in the training root:
+
+- `msa_manifest.tsv`, one row per training MSA build attempt.
+- `sequence_manifest.tsv.gz`, retained sequence-to-cluster membership.
+- `kept_sequence_index.tsv.gz`, sequence index for the kept subset.
+- `kept_reaction_parameters.tsv.gz`, GotEnzymes reaction rows for kept entries.
+- `sequence_label_summary.tsv.gz`, per-sequence numeric and categorical labels.
+- `trimmed_alignments/`, final aligned FASTA files.
+- `esm_msa_embeddings_col/`, pooled ESM-MSA embeddings for older baselines.
+- `esm_msa_token_embeddings_col/`, active token-grid cache with
+  `token_embeddings` stored.
+
+ESM-MSA accepts at most 1024 tokens including its special token, so training
+embedding precompute uses `--max-cols 1023`.
+
+## Environment
+
+Use the dedicated CUDA conda environment:
 
 ```bash
 /home/florian/miniforge3/bin/mamba env create -f environment.yml
@@ -49,64 +116,45 @@ conda activate msa_design
 Without shell activation, run commands through the environment directly:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py --help
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/train_mean_start_ccdd_from_cached_msas.py --help
 ```
 
-The environment includes Python 3.10, NumPy, CUDA PyTorch (`pytorch-cuda=12.4`), Kalign for fast protein alignment, and `fair-esm`. On this machine it detects the RTX 3060 via CUDA.
+The environment includes Python 3.10, CUDA PyTorch, Kalign, NumPy, and
+`fair-esm`. Local CUDA tests have used the RTX 3060.
 
-## Commands
+## GotEnzymes Framing
 
-Inspect the archive structure and a small row sample:
+`input_data/enzymes/*.txt` rows have 11 tab-separated columns:
+
+1. `gene_id`
+2. `organism_code`
+3. `domain`
+4. `reaction_id`
+5. `ec_numbers`
+6. `compound_id`
+7. `kcat_1_per_s`
+8. `km_mM`
+9. `kcat_over_km_1_per_mM_s`
+10. `topt_C`
+11. `tm_C`
+
+The `kcat/Km` field is preserved as a dataset-provided value, not recomputed
+from displayed `kcat` and `Km`. Missing kinetic values appear as `nan`.
+
+The primary sequence key is the KEGG gene entry
+`organism_code:gene_id`, for example `aaa:Acav_0021`. UniProt accessions in the
+GotEnzymes supplementary files are cross-references, not the primary sequence
+keys.
+
+## Data Pipeline
+
+Inspect the archive:
 
 ```bash
-python3 scripts/inspect_dataset.py --zip data/input_data.zip --max-enzyme-files 5 --sample-rows 8
+python3 scripts/inspect_dataset.py --zip data/input_data.zip --sample-rows 8
 ```
 
-Run a fuller inspection by omitting `--max-enzyme-files`:
-
-```bash
-python3 scripts/inspect_dataset.py --zip data/input_data.zip
-```
-
-Fetch/remap a small EC family from early organism files:
-
-```bash
-python3 scripts/remap_kegg_sequences.py \
-  --zip data/input_data.zip \
-  --ec 1.1.1.3 \
-  --limit 5 \
-  --max-enzyme-files 10 \
-  --out-fasta outputs/pilot_msas/ec_1_1_1_3.fasta \
-  --out-index outputs/pilot_msas/ec_1_1_1_3.sequence_index.tsv \
-  --out-metadata outputs/pilot_msas/ec_1_1_1_3.metadata.tsv
-```
-
-Build an MSA:
-
-```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/build_msa.py \
-  outputs/pilot_msas/ec_1_1_1_3.fasta \
-  outputs/pilot_msas/ec_1_1_1_3.msa.fasta
-```
-
-Create a few pilot families end to end:
-
-```bash
-python3 scripts/pilot_families.py --families 3 --seqs-per-family 5 --scan-files 25
-```
-
-`build_msa.py` uses external Kalign in `fast` mode by default when it is available, then MAFFT if Kalign is missing. If neither is available, it falls back to a deterministic pure-Python center-star Needleman-Wunsch alignment. That fallback is only meant for tiny pilot MSAs and is not production-quality.
-
-## KEGG Sequence Remapping
-
-`scripts/remap_kegg_sequences.py` writes normalized sequence/remap artifacts from GotEnzymes rows:
-
-- FASTA: one source KEGG protein sequence per selected unique `organism_code:gene_id`
-- sequence index TSV: one row per selected KEGG gene entry, with sequence status/length/source
-- per-gene metadata TSV: one row per selected KEGG gene entry, aggregating all selected reaction/compound/property rows
-- optional row-map TSV: one row per original GotEnzymes property row, with `sequence_id` pointing to the matching KEGG FASTA record
-
-For small selections, the script can fetch exact source sequences through KEGG REST:
+Small KEGG remap smoke test:
 
 ```bash
 python3 scripts/remap_kegg_sequences.py \
@@ -120,7 +168,7 @@ python3 scripts/remap_kegg_sequences.py \
   --out-row-map outputs/kegg_remap/ec_1_1_1_3.rows.tsv
 ```
 
-For the full local archive, use a licensed local KEGG dump rather than KEGG REST:
+For full remapping, use a local KEGG dump rather than KEGG REST:
 
 ```bash
 python3 scripts/remap_kegg_sequences.py \
@@ -133,163 +181,272 @@ python3 scripts/remap_kegg_sequences.py \
   --out-row-map outputs/kegg_remap/all_gotenzymes_rows.tsv
 ```
 
-The local archive currently contains 59,631,387 GotEnzymes property rows over 8,368,096 unique KEGG gene entries. KEGG REST `get ... /aaseq` is limited to 10 entries per request, so a complete remap should use the local KEGG `genes/organisms/<org>/<org>.pep` files that GotEnzymes was originally built from. The REST path is for smoke tests and small EC/organism subsets.
-
-For a balanced working subset, `scripts/sample_kegg_family_sequences.py` scans the GotEnzymes archive, samples EC/reaction families with stable hash sampling, fetches the exact KEGG source sequences, and writes combined plus per-family FASTAs:
+Build trimmed training MSAs from clustered members:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/sample_kegg_family_sequences.py \
-  --target-sequences 5000 \
-  --seqs-per-family 50 \
-  --min-seqs-per-family 50 \
-  --out-dir outputs/kegg_representative_5000 \
-  --sleep-seconds 0.4 \
-  --max-rest-requests 1000
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/build_training_msas_from_clusters.py \
+  --input-fasta /path/to/all_clustered_sequences.fasta \
+  --members /path/to/good_msa_members.tsv \
+  --out-root /mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim \
+  --kalign tools/kalign/bin/kalign \
+  --workers 8 \
+  --kalign-threads 2 \
+  --max-column-gap 0.20 \
+  --max-sequence-gap 0.30 \
+  --min-sequences 16 \
+  --min-columns 50 \
+  --min-residues 30 \
+  --sequence-index /path/to/all_sequence_index.tsv.gz \
+  --reaction-rows /path/to/all_reaction_parameters_uniprot.tsv.gz
 ```
 
-The local `outputs/kegg_representative_5000/` run contains:
-
-- `combined.fasta`: 5,000 exact KEGG protein sequences
-- `families.tsv`: 100 selected EC/reaction families, balanced across EC classes
-- `entries.tsv`: selected KEGG entries with family assignment, sequence metadata, and per-entry GotEnzymes kinetic values (`kcat_1_per_s_values`, `km_mM_values`, `kcat_over_km_1_per_mM_s_values`, `topt_C_values`, `tm_C_values`)
-- `sequence_index.tsv`: sequence status, length, source cache path, and KEGG FASTA header
-- `families/*.fasta`: one 50-sequence FASTA per selected family
-- `msas/*.msa.fasta`: Kalign alignments for all selected families
-- `topup_replacements.tsv`: 10 selected KEGG entries that lacked `aaseq` responses and their replacement entries
-
-## MSA Transformer Embedding
-
-`scripts/embed_msas.py` embeds aligned FASTA/A3M files with ESM MSA Transformer using the local ignored weights at `weights/esm_msa1b_t12_100M_UR50S.pt`. The real embedding path requires an environment with `torch`, `numpy`, and `esm`/`fair-esm` installed; use the dedicated `msa_design` environment above. The script imports `torch` and `esm` lazily, so parsing and shape checks can run without those packages.
-
-Dry-run one pilot MSA without loading the model:
+Aggregate sequence-level labels, including the current `organism_code`
+categorical field:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
-  --msa outputs/pilot_msas/ec_1_1_1_3.msa.fasta \
-  --out-dir outputs/embeddings \
-  --dry-run
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/build_sequence_label_summary.py \
+  --reaction-rows /mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim/kept_reaction_parameters.tsv.gz \
+  --out /mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_label_summary.tsv.gz
 ```
 
-Dry-run every pilot MSA:
+Precompute active ESM-MSA token-grid embeddings:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
-  --msa-glob 'outputs/pilot_msas/*.msa.fasta' \
-  --out-dir outputs/embeddings \
-  --dry-run
-```
-
-Prepare reproducible embedding commands or a TSV manifest:
-
-```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/prepare_embedding_jobs.py --dry-run
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/prepare_embedding_jobs.py --out-manifest outputs/embeddings/jobs.tsv
-```
-
-Run real embedding in the dedicated environment:
-
-```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/embed_msas.py \
-  --msa-glob 'outputs/pilot_msas/*.msa.fasta' \
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/precompute_training_msa_embeddings.py \
+  --msa-manifest /mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim/msa_manifest.tsv \
+  --out-dir /mnt/backup4TB/MSA_DESIGN/training_msas_50_identity_core_gaptrim/esm_msa_token_embeddings_col \
   --weights weights/esm_msa1b_t12_100M_UR50S.pt \
-  --out-dir outputs/embeddings \
-  --device auto \
+  --device cuda \
   --max-seqs 64 \
-  --max-cols 1024
+  --max-cols 1023 \
+  --dtype float16 \
+  --store-token-embeddings
 ```
 
-Each MSA writes `outputs/embeddings/<stem>.npz` plus `outputs/embeddings/<stem>.metadata.json`. The NPZ contains:
+## Training
 
-- `token_embeddings`, shape `rows x cols x hidden_dim`, unless `--pool-only` or `--no-include-token-embeddings` is used
-- `row_embeddings`, mean embedding per MSA row over non-gap amino-acid positions
-- `col_embeddings`, mean embedding per aligned column over non-gap amino-acid positions
-- `query_embedding`, row-0 mean over non-gap positions
-- `msa_embedding`, global mean over all non-gap positions
-- `aa_mask`, `gap_mask`, `row_aa_counts`, and `col_aa_counts`
-
-A3M lowercase insertion characters and dots are removed before validation. Gaps (`-`) are preserved. MSAs are deterministically cropped to the first `--max-seqs` rows and first `--max-cols` columns, with crop notes recorded in metadata. The next modeling step should consume the pooled arrays or project/compress `token_embeddings` before conditioning on enzyme metadata.
-
-
-## Trainable Predictor Prototype
-
-The first trainable stack lives in `msa_design_model/` and keeps the MSA Transformer boundary frozen:
-
-- `FrozenMSATransformerEncoder` wraps local `fair-esm` MSA Transformer loading, sets all MSAformer parameters to `requires_grad=False`, and exposes an `encode()` method for future end-to-end use.
-- `RowColumnProjector` consumes frozen token embeddings with shape `B x R x L x H`, builds masked row and column context features, fuses `token + row + column`, and projects/pools to an `L x d` matrix per MSA.
-- `NumericConditionTokenBank` has separate numeric embedding heads for `kcat_1_per_s`, `km_mM`, `kcat_over_km_1_per_mM_s`, `topt_C`, and `tm_C`. Missing values use learned missing tokens.
-- `EnzymeMSAPredictor` appends the numeric condition tokens to the projected `L x d` MSA matrix, runs a small trainable Transformer encoder, pools, and predicts a requested numeric target.
-
-Smoke-train the predictor from the precomputed EC-family embeddings:
+The generic launcher is `scripts/run_mean_start_ccdd_full_profile_row.sh`.
+Override its environment variables for the active architecture:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/train_predictor.py \
-  --epochs 3 \
-  --batch-size 2 \
-  --d-model 64 \
-  --layers 1 \
-  --heads 4 \
-  --device cpu \
-  --out-checkpoint outputs/checkpoints/predictor_smoke.pt
+DATA_ROOT=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim \
+EMBED_DIR=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/esm_msa_token_embeddings_col \
+MEMORY_MODE=profile_msa_axial \
+PROFILE_FEATURE_MODE=no_aa_frequency \
+BATCH_SIZE=1 \
+D_MODEL=192 \
+CONTINUOUS_TARGET_MODE=target_row_embedding \
+MASKED_ROWS_PER_MSA_MIN=4 \
+MASKED_ROWS_PER_MSA_MAX=5 \
+MSA_EMBEDDING_DTYPE=float16 \
+AMP=fp16 \
+MSA_AXIAL_LAYERS=1 \
+CONSENSUS_LOSS_MODE=residual \
+CONSENSUS_MATCH_WEIGHT=0.35 \
+NONCONSENSUS_WEIGHT=2.5 \
+UNOBSERVED_NONCONSENSUS_WEIGHT=1.0 \
+MAX_SEQUENCE_LOSS_WEIGHT=3.0 \
+CONDITION_MASK_PROB=0.0 \
+VAL_BATCHES=64 \
+CHECKPOINT_EVERY_STEPS=500 \
+MAX_STEPS=544000 \
+scripts/run_mean_start_ccdd_full_profile_row.sh \
+  /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/mean_start_ccdd_current_run
 ```
 
-By default, `scripts/train_predictor.py` predicts `kcat_1_per_s` using `outputs/embeddings/ec_*.npz` and matching `outputs/pilot_msas/<stem>.metadata.tsv` rows. Semicolon-separated numeric metadata values are aggregated as the mean of finite values. The target field still has a condition-token slot, but it is masked as missing unless `--include-target-as-condition` is explicitly passed, avoiding target leakage in the default setup.
-
-The saved checkpoint contains only trainable predictor weights and config; MSA Transformer weights remain frozen/precomputed.
-
-## Sequence Diffusion Decoder Prototype
-
-The sequence-design decoder keeps the MSA Transformer boundary frozen, then adds two trainable stages:
-
-- `MSADepthScaler` consumes frozen token embeddings with shape `B x R x L x H` and compresses the MSA row/depth axis into `B x L x d` with learned depth attention. The aligned-column length `L` can differ per family and is carried as a mask.
-- `MetadataConditionTokenBank` encodes enzyme metadata as prepended context tokens. Numeric fields such as `kcat_1_per_s`, `km_mM`, `kcat_over_km_1_per_mM_s`, `topt_C`, and `tm_C` pass through per-field MLPs after dataset normalization. Categorical fields such as `ec_numbers`, `reaction_ids`, and `compound_ids` pass through learned vocab embeddings and support semicolon-separated multi-value metadata.
-- Condition tokens run through a small self-attention mixer, then they are prepended to the MSA latent memory. They are not generated as sequence tokens.
-- `SequenceDiffusionDecoder` generates a fixed `1280` output positions by default. It cross-attends from those fixed output positions into the variable-length `B x L x d` MSA latent.
-- `MSASequenceDiffusionModel` combines both pieces for training or sampling.
-
-Protein sequences use `*` as the STOP token. Targets are encoded as residues, then the first `*`, then repeated trailing `*` tokens until the fixed decoder length. Residues and the first `*` get full token-loss weight; trailing padding `*` tokens get a low weight so the decoder learns termination without being dominated by padding. The training loss reconstructs the protein sequence under the supplied condition prefix, rather than predicting metadata tokens as part of the protein alphabet. Training also logs weighted token reconstruction accuracy as a metric; the optimized objective stays differentiable.
-
-Decoder-side starts default to `--decoder-start-mode mean`: every output position starts from the learned mean amino-acid embedding, with cross-attention into the remaining MSA rows and metadata condition tokens. This is the default for new continuous reconstruction runs because q-sampled target embeddings proved too easy to denoise. Sequence-only discrete diffusion is available with `--decoder-start-mode discrete_mask`: at timestep `t`, target token IDs are replaced by a real `<MASK>` token with probability `(t + 1) / diffusion_timesteps`. By default the CE loss is applied only to corrupted positions, and `--condition-dropout` randomly replaces MSA/metadata memory with a learned null token so the discrete sampler can use classifier-free guidance. Sampling starts from all `<MASK>` tokens and iteratively fills/remasks by confidence.
-
-`scripts/train_sequence_decoder.py` creates one training example per aligned MSA row when matching metadata TSV rows are available. The same family MSA can therefore condition on different row-level kinetic/reaction metadata and reconstruct the corresponding row sequence.
-Requested numeric condition fields must contain at least one observed value by default; this prevents accidental all-missing kinetic tokens. If a missing-only ablation is intentional, pass `--allow-empty-numeric-condition-fields`.
-
-If a decoder metadata directory was built before kinetic value columns were propagated, backfill it directly from the GotEnzymes archive:
+To partial-resume when adding a condition token or head:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/enrich_metadata_from_gotenzymes.py \
-  --metadata-dir outputs/training/okay24_20260713_233827/metadata \
-  --in-place
+RESUME_CHECKPOINT=/path/to/mean_start_ccdd.best.pt \
+ALLOW_PARTIAL_RESUME=1 \
+RESET_OPTIMIZER=1 \
+scripts/run_mean_start_ccdd_full_profile_row.sh /path/to/new_out_dir
 ```
 
-Smoke-train the conditioned decoder from precomputed MSA embeddings and metadata:
+Current mixed-MSA context launcher:
 
 ```bash
-/home/florian/miniforge3/envs/msa_design/bin/python scripts/train_sequence_decoder.py \
-  --epochs 1 \
-  --batch-size 1 \
-  --d-model 64 \
-  --layers 1 \
-  --heads 4 \
-  --device cpu \
-  --max-examples 2 \
-  --max-sequence-length 1280 \
-  --decoder-start-mode mean \
-  --numeric-condition-fields kcat_1_per_s,km_mM,kcat_over_km_1_per_mM_s,topt_C,tm_C \
-  --categorical-condition-fields ec_numbers,reaction_ids,compound_ids \
-  --out-checkpoint outputs/checkpoints/sequence_diffusion_smoke.pt
+DATA_ROOT=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim \
+scripts/run_mean_start_ccdd_mixed_msa64.sh
 ```
 
-For faster CPU wiring checks, use a smaller temporary `--max-sequence-length`; production runs should use the default `1280`.
+That wrapper resumes from the organism-code checkpoint, sets
+`MEMORY_MODE=profile_msa_axial`, `MIXED_MSA_CONTEXT_ROWS=64`,
+`MASKED_ROWS_PER_MSA_MIN=1`, `MASKED_ROWS_PER_MSA_MAX=1`, fp16 cached token
+embeddings, fp16 AMP, and the residual objective.
 
-## Legacy UniProt Fetching
+Training outputs:
 
-`fetch_family_sequences.py` is kept as a legacy pilot helper. It queries UniProt by exact KEGG cross-reference, for example `xref:KEGG-aaa\:Acav_0021`, then falls back to `gene_exact:<gene_id>`. That is useful for ad-hoc cross-checking, but the source-faithful GotEnzymes remap should use `remap_kegg_sequences.py`.
+- `train.log`, launcher and trainer logs.
+- `metrics.tsv`, train-window and validation metrics.
+- `mean_start_ccdd.latest.pt`, latest checkpoint.
+- `mean_start_ccdd.best.pt` plus `mean_start_ccdd.best.json`, best validation
+  checkpoint by loss.
+- `decode_step_*.fasta`, deterministic decode snapshots.
 
-The fetcher sleeps between REST calls by default and caches JSON responses under `data/cache/uniprot/`.
+## Evaluation And Generation
 
-## Next Steps
+Compare deterministic model decode against leave-one-row-out consensus:
 
-- Decide whether sequence families should be grouped by exact EC, EC prefix, reaction, substrate, organism domain, or combinations of those fields.
-- Cluster fetched enzymes into tight homolog groups before MSA embedding, then align each close group with Kalign. Broad EC-level MSAs are useful for smoke tests, but tight local alignments should be cleaner conditioning targets for the decoder.
-- Scale MSA Transformer embedding beyond smoke tests and train/evaluate the predictor with proper family-level splits.
-- Define train/validation splits by homology or family, not random rows, to avoid leakage in downstream design models.
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/evaluate_checkpoint_vs_consensus.py \
+  --checkpoint /path/to/mean_start_ccdd.best.pt \
+  --embedding-manifest /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/esm_msa_token_embeddings_col/embedding_manifest.tsv \
+  --label-summary /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_label_summary.tsv.gz \
+  --path-rewrite /mnt/backup4TB=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa \
+  --split test \
+  --example-limit 2048 \
+  --batch-size 4 \
+  --device cuda \
+  --amp checkpoint \
+  --summary-json /path/to/summary.json \
+  --out-tsv /path/to/predictions.tsv
+```
+
+In this benchmark, "model beats consensus" means the decoded sequence has
+higher identity to the hidden target row than the leave-one-row-out consensus
+sequence for that same held-out row.
+
+Generate one baseline-vs-thermostable contrast:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/generate_thermostability_contrast.py \
+  --checkpoint /path/to/mean_start_ccdd.best.pt \
+  --embedding-manifest /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/esm_msa_token_embeddings_col/embedding_manifest.tsv \
+  --label-summary /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_label_summary.tsv.gz \
+  --sequence-manifest /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_manifest.tsv.gz \
+  --path-rewrite /mnt/backup4TB=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa \
+  --device cuda \
+  --amp checkpoint \
+  --msa-embedding-dtype float16 \
+  --category-override organism_code=eco \
+  --thermo-topt 68 \
+  --thermo-tm 78 \
+  --out-dir /path/to/thermostability_contrast
+```
+
+Generate a batch of thermostability contrasts:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/generate_thermostability_batch.py \
+  --checkpoint /path/to/mean_start_ccdd.best.pt \
+  --embedding-manifest /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/esm_msa_token_embeddings_col/embedding_manifest.tsv \
+  --label-summary /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_label_summary.tsv.gz \
+  --sequence-manifest /media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/sequence_manifest.tsv.gz \
+  --path-rewrite /mnt/backup4TB=/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa \
+  --out-dir /path/to/thermostability_batch \
+  --target-count 50 \
+  --device cuda \
+  --amp checkpoint \
+  --msa-embedding-dtype float16 \
+  --thermo-topt 60 \
+  --thermo-tm 75
+```
+
+`generate_thermostability_batch.py` can optionally rebuild inference MSAs with
+farthest-Hamming rows:
+
+```bash
+--inference-msa-row-selection farthest_hamming \
+--farthest-msa-rows 64 \
+--farthest-max-cols 1024 \
+--farthest-embedding-out-dir /path/to/rebuilt_embeddings
+```
+
+After folding batch FASTAs with ColabFold, summarize structure-side signals:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/analyze_thermostability_salt_bridge_batch.py \
+  --metadata /path/to/batch_metadata.tsv \
+  --fold-dir /path/to/colabfold_outputs \
+  --out-dir /path/to/salt_bridge_analysis
+
+/home/florian/miniforge3/envs/msa_design/bin/python scripts/analyze_thermostability_hydrophobic_packing_batch.py \
+  --metadata /path/to/batch_metadata.tsv \
+  --fold-dir /path/to/colabfold_outputs \
+  --out-dir /path/to/hydrophobic_packing_analysis \
+  --salt-bridge-summary /path/to/salt_bridge_analysis/salt_bridge_batch_summary.tsv
+```
+
+## Current Results Snapshot
+
+The strongest current pre-mixing organism-code checkpoint is:
+
+```text
+/media/florian/dc434ad3-38cd-442f-b7af-41802cfa5baa/MSA_DESIGN/training_msas_50_identity_core_gaptrim/mean_start_ccdd_organismcode_condtokens_targetrow_latents_direct_axial_reads_sharedgrid_grouped_4to5_noaa_esmmsa_tokens_fullgrid_fp16amp_residual_condtokens_unmasked_partialresume_frombest173500_20260805_211457/mean_start_ccdd.best.pt
+```
+
+Checkpoint metadata:
+
+- Best step: 321500.
+- Validation loss: 1.21568.
+- Validation token accuracy: 0.64468.
+- Validation residue accuracy: 0.62212.
+- Validation non-consensus residue accuracy: 0.54503.
+
+Held-out `test` benchmark on 2,048 examples:
+
+- Model deterministic t0 residue accuracy: 0.588761.
+- Model mean sequence identity: 0.610307.
+- Leave-one-row-out consensus residue accuracy: 0.739413.
+- Consensus mean sequence identity: 0.737670.
+- Model beat consensus on 875 of 2,048 examples.
+- Model variable-nonconsensus-position accuracy: 0.540072.
+
+The mixed-64 MSA context experiment was stopped after it degraded strongly:
+best step 333500, validation loss 2.69714, token accuracy 0.22105, residue
+accuracy 0.10963.
+
+One E. coli-conditioned thermostability contrast for cluster `23854` and target
+`cps:CPS_3483` used `organism_code=eco`, `Topt=68`, and `Tm=78`. The baseline
+and thermostable generated sequences had identity 0.9655. Custom-A3M ColabFold
+folds of consensus vs thermostable gave mean pLDDT 89.05 and 88.38, both pTM
+0.83, with CA RMSD 0.782 A over 203 C-alpha atoms.
+
+These are research diagnostics, not validated design claims.
+
+## Legacy And Baseline Helpers
+
+These scripts remain in the repo but are no longer the main architecture:
+
+- `scripts/embed_msas.py`, pilot MSA embedding for small aligned FASTA/A3M
+  files.
+- `scripts/train_predictor.py`, frozen MSA predictor prototype for numeric
+  targets.
+- `scripts/train_sequence_decoder.py`, older fixed-length conditional diffusion
+  decoder using compressed MSA depth memory.
+- `scripts/train_aligned_column_decoder.py`, aligned-column decoder prototype.
+- `scripts/decode_aligned_column_checkpoint.py`, legacy checkpoint decoding.
+- `scripts/diagnose_attention_feature_importance.py`, attention diagnostics.
+- `scripts/fetch_family_sequences.py`, legacy UniProt lookup helper. For
+  source-faithful GotEnzymes work, prefer KEGG remapping and the UniProt-backed
+  training MSA build path.
+
+## Development Checks
+
+Run the unit tests:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python -m pytest tests
+```
+
+Compile the active model and script surfaces after broad edits:
+
+```bash
+/home/florian/miniforge3/envs/msa_design/bin/python -m py_compile \
+  msa_design_model/model.py \
+  msa_design_model/__init__.py \
+  scripts/train_mean_start_ccdd_from_cached_msas.py \
+  scripts/evaluate_checkpoint_vs_consensus.py \
+  scripts/generate_thermostability_contrast.py \
+  scripts/generate_thermostability_batch.py \
+  scripts/analyze_thermostability_salt_bridge_batch.py \
+  scripts/analyze_thermostability_hydrophobic_packing_batch.py
+```
+
+Use `bash -n` for launcher syntax:
+
+```bash
+bash -n scripts/run_mean_start_ccdd_full_profile_row.sh
+bash -n scripts/run_mean_start_ccdd_mixed_msa64.sh
+```

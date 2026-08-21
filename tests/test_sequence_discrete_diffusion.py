@@ -25,6 +25,7 @@ from scripts.train_sequence_decoder import (  # noqa: E402
     curriculum_timestep_range,
 )
 from scripts.train_mean_start_ccdd_from_cached_msas import (  # noqa: E402
+    CATEGORICAL_FIELDS,
     MeanStartCCDDModel,
     target_row_residue_embeddings,
 )
@@ -285,8 +286,8 @@ def test_mean_start_target_row_embedding_continuous_objective() -> None:
         msa_embedding_mask=torch.zeros(1, 0, 6, dtype=torch.bool),
         numeric_values=torch.zeros(1, 5),
         numeric_mask=torch.zeros(1, 5, dtype=torch.bool),
-        category_ids=torch.full((1, 4), -1, dtype=torch.long),
-        category_mask=torch.zeros(1, 4, dtype=torch.bool),
+        category_ids=torch.full((1, len(CATEGORICAL_FIELDS)), -1, dtype=torch.long),
+        category_mask=torch.zeros(1, len(CATEGORICAL_FIELDS), dtype=torch.bool),
         target_tokens=target_tokens,
         loss_weights=loss_weights,
         sequence_loss_weights=sequence_loss_weights,
